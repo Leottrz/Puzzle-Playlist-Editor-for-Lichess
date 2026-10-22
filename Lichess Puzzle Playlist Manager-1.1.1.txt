@@ -1,0 +1,504 @@
+// ==UserScript==
+// @name         Lichess Puzzle Playlist Manager
+// @namespace    local.lichess-puzzle-playlist
+// @version      1.1.1
+// @description  Load Lichess puzzle activity with a temporary API token or import JSON, then manage a searchable playlist.
+// @match        https://lichess.org/*
+// @match        https://www.lichess.org/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(() => {
+  'use strict';
+
+  const STORAGE_KEY = 'tmLichessPuzzlePlaylist.v1';
+  const ROOT_ID = 'tm-lpp-root';
+  if (document.getElementById(ROOT_ID)) return;
+
+  const state = {
+    puzzles: [],
+    currentIndex: 0,
+    completed: new Set(),
+    filter: '',
+    failedOnly: false,
+    collapsed: false,
+    sourceName: ''
+  };
+
+  const css = `
+    #${ROOT_ID}{position:fixed;z-index:999999;right:18px;bottom:18px;width:360px;max-height:82vh;
+      color:#eee;background:#202321;border:1px solid #555;border-radius:12px;box-shadow:0 8px 30px #0008;
+      font:14px/1.4 system-ui,-apple-system,Segoe UI,sans-serif;display:flex;flex-direction:column;overflow:hidden}
+    #${ROOT_ID} *{box-sizing:border-box}
+    #${ROOT_ID} button,#${ROOT_ID} input{font:inherit}
+    #${ROOT_ID} button{cursor:pointer;border:1px solid #555;border-radius:7px;padding:7px 9px;color:#eee;background:#353a37}
+    #${ROOT_ID} button:hover{background:#454c47}
+    #${ROOT_ID} button.primary{background:#81b64c;color:#17210f;border-color:#81b64c;font-weight:700}
+    #${ROOT_ID} .lpp-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px;background:#2b302d;border-bottom:1px solid #444}
+    #${ROOT_ID} .lpp-title{font-weight:750;font-size:15px}
+    #${ROOT_ID} .lpp-head button{padding:3px 8px}
+    #${ROOT_ID} .lpp-body{padding:10px;display:flex;flex-direction:column;gap:9px;min-height:0;overflow:hidden}
+    #${ROOT_ID} .lpp-row{display:flex;gap:6px;align-items:center}
+    #${ROOT_ID} .lpp-row>*{min-width:0}
+    #${ROOT_ID} input[type=text],#${ROOT_ID} input[type=password],#${ROOT_ID} input[type=number]{width:100%;background:#171917;color:#eee;border:1px solid #555;border-radius:7px;padding:8px}
+    #${ROOT_ID} input[type=number]{max-width:110px}
+    #${ROOT_ID} .lpp-muted{color:#b5bcb7;font-size:12px}
+    #${ROOT_ID} .lpp-status{padding:7px 8px;background:#171917;border-radius:7px;color:#cbd4cd;font-size:12px;overflow-wrap:anywhere}
+    #${ROOT_ID} .lpp-current{border:1px solid #4c554e;background:#292e2b;border-radius:9px;padding:10px}
+    #${ROOT_ID} .lpp-current a{color:#a8d875;text-decoration:none;font-weight:700;font-size:16px}
+    #${ROOT_ID} .lpp-list{overflow:auto;min-height:70px;max-height:260px;border:1px solid #444;border-radius:8px}
+    #${ROOT_ID} .lpp-item{display:flex;gap:8px;align-items:center;width:100%;text-align:left;border:0!important;border-radius:0!important;border-bottom:1px solid #3c423e!important;background:transparent!important;padding:8px!important}
+    #${ROOT_ID} .lpp-item:last-child{border-bottom:0!important}
+    #${ROOT_ID} .lpp-item.active{background:#39443a!important}
+    #${ROOT_ID} .lpp-item .lpp-item-main{flex:1;min-width:0}
+    #${ROOT_ID} .lpp-item .lpp-id{font-weight:700}
+    #${ROOT_ID} .lpp-item .lpp-sub{font-size:11px;color:#b5bcb7;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    #${ROOT_ID} .lpp-check{color:#a8d875;font-weight:800}
+    #${ROOT_ID} .lpp-hidden{display:none!important}
+    #${ROOT_ID} .lpp-file{display:none}
+    @media(max-width:500px){#${ROOT_ID}{right:8px;bottom:8px;width:min(360px,calc(100vw - 16px));max-height:78vh}}
+  `;
+
+  const style = document.createElement('style');
+  style.textContent = css;
+  document.head.appendChild(style);
+
+  const root = document.createElement('section');
+  root.id = ROOT_ID;
+  root.innerHTML = `
+    <div class="lpp-head">
+      <div class="lpp-title">♟ Puzzle Playlist</div>
+      <div class="lpp-row">
+        <button type="button" data-action="minimize" title="Minimize">−</button>
+        <button type="button" data-action="close" title="Close panel">×</button>
+      </div>
+    </div>
+    <div class="lpp-body">
+      <div class="lpp-row">
+        <button type="button" class="primary" data-action="load">Load JSON</button>
+        <button type="button" data-action="export">Export playlist</button>
+        <input class="lpp-file" type="file" accept=".json,application/json">
+      </div>
+      <div class="lpp-muted" data-role="filename">No file loaded. Supports arrays with puzzle.id, or lists of puzzle URLs/IDs.</div>
+      <div style="border:1px solid #444;border-radius:8px;padding:9px;display:flex;flex-direction:column;gap:7px">
+        <div style="font-weight:700">Load from Lichess account</div>
+        <input type="password" data-role="api-token" autocomplete="off" placeholder="Lichess API token (puzzle:read)">
+        <div class="lpp-row">
+          <label class="lpp-muted" style="flex:1">Max entries (blank = all)
+            <input type="number" data-role="api-max" min="1" step="1" placeholder="5000" value="5000" style="margin-top:4px">
+          </label>
+          <button type="button" class="primary" data-action="load-api">Load history</button>
+        </div>
+        <div class="lpp-muted">Token is used only for this request and cleared afterward; it is not saved by this script. Create a token with only puzzle:read permission.</div>
+      </div>
+      <div class="lpp-row">
+        <input type="text" data-role="search" placeholder="Search ID, rating, theme, result…">
+      </div>
+      <label class="lpp-row lpp-muted" style="cursor:pointer">
+        <input type="checkbox" data-role="failed-only" style="accent-color:#81b64c">
+        Show failed puzzles only (win = false)
+      </label>
+      <div class="lpp-current">
+        <div class="lpp-muted" data-role="position">No playlist loaded</div>
+        <div style="margin:5px 0"><a data-role="current-link" href="https://lichess.org/training" target="_blank" rel="noopener">Open a puzzle</a></div>
+        <div class="lpp-muted" data-role="details">Load a JSON file to begin.</div>
+      </div>
+      <div class="lpp-row">
+        <button type="button" data-action="prev">← Previous</button>
+        <button type="button" class="primary" data-action="open">Open puzzle</button>
+        <button type="button" data-action="next">Next →</button>
+      </div>
+      <div class="lpp-row">
+        <button type="button" data-action="toggle-complete">Mark completed ✓</button>
+        <button type="button" data-action="shuffle">Shuffle</button>
+        <button type="button" data-action="reset">Reset progress</button>
+      </div>
+      <div class="lpp-status" data-role="status">Ready. Your data stays in this browser unless you export it.</div>
+      <div class="lpp-list" data-role="list" aria-label="Puzzle playlist"></div>
+      <div class="lpp-muted">Tip: puzzle pages open in this tab. Use browser Back to return, or Ctrl/Cmd-click a list link to open a new tab.</div>
+    </div>
+  `;
+  document.body.appendChild(root);
+
+  const $ = (sel) => root.querySelector(sel);
+  const fileInput = $('.lpp-file');
+  const listEl = $('[data-role="list"]');
+  const searchEl = $('[data-role="search"]');
+  const failedOnlyEl = $('[data-role="failed-only"]');
+  const apiTokenEl = $('[data-role="api-token"]');
+  const apiMaxEl = $('[data-role="api-max"]');
+
+  function safeText(value) {
+    return String(value ?? '').replace(/\s+/g, ' ').trim();
+  }
+
+  function puzzleUrl(id) {
+    return `https://lichess.org/training/${encodeURIComponent(id)}`;
+  }
+
+  function normalizePuzzle(item) {
+    if (typeof item === 'string') {
+      const match = item.match(/lichess\.org\/(?:training\/)?([A-Za-z0-9_-]{3,})/i);
+      const id = match ? match[1] : item.trim();
+      if (!/^[A-Za-z0-9_-]{3,}$/.test(id)) return null;
+      return { id, rating: null, themes: [], win: null, raw: item };
+    }
+
+    if (!item || typeof item !== 'object') return null;
+    const puzzle = item.puzzle && typeof item.puzzle === 'object' ? item.puzzle : item;
+    let id = puzzle.id || item.puzzleId || item.id;
+    if (!id && typeof item.url === 'string') {
+      const match = item.url.match(/lichess\.org\/(?:training\/)?([A-Za-z0-9_-]{3,})/i);
+      if (match) id = match[1];
+    }
+    if (!id && typeof item.link === 'string') {
+      const match = item.link.match(/lichess\.org\/(?:training\/)?([A-Za-z0-9_-]{3,})/i);
+      if (match) id = match[1];
+    }
+    if (!id || !/^[A-Za-z0-9_-]{3,}$/.test(String(id))) return null;
+
+    const themes = Array.isArray(puzzle.themes) ? puzzle.themes : (Array.isArray(item.themes) ? item.themes : []);
+    return {
+      id: String(id),
+      rating: Number.isFinite(Number(puzzle.rating)) && puzzle.rating !== '' ? Number(puzzle.rating) : null,
+      themes: themes.map(safeText).filter(Boolean),
+      win: typeof item.win === 'boolean' ? item.win : (typeof puzzle.win === 'boolean' ? puzzle.win : null),
+      raw: item
+    };
+  }
+
+  function extractItems(data) {
+    if (Array.isArray(data)) return data;
+    if (data && typeof data === 'object') {
+      for (const key of ['puzzles', 'playlist', 'items', 'history', 'results']) {
+        if (Array.isArray(data[key])) return data[key];
+      }
+      if (data.puzzle || data.id || data.url || data.link) return [data];
+    }
+    throw new Error('JSON must be an array, or an object containing a puzzles/playlist/items/history/results array.');
+  }
+
+  function persist() {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({
+        puzzles: state.puzzles,
+        currentIndex: state.currentIndex,
+        completed: [...state.completed],
+        sourceName: state.sourceName,
+        failedOnly: state.failedOnly
+      }));
+    } catch (err) {
+      setStatus('Could not save to local storage. The playlist will still work until you leave this page.');
+    }
+  }
+
+  function restore() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
+      if (!saved || !Array.isArray(saved.puzzles)) return;
+      state.puzzles = saved.puzzles.map(normalizePuzzle).filter(Boolean);
+      state.currentIndex = Math.min(Math.max(0, Number(saved.currentIndex) || 0), Math.max(0, state.puzzles.length - 1));
+      state.completed = new Set(Array.isArray(saved.completed) ? saved.completed : []);
+      state.sourceName = saved.sourceName || 'Saved playlist';
+      state.failedOnly = saved.failedOnly === true;
+      failedOnlyEl.checked = state.failedOnly;
+      render();
+      setStatus(`Restored ${state.puzzles.length} puzzles from this browser.`);
+    } catch (_) {}
+  }
+
+  function setStatus(message) {
+    $('[data-role="status"]').textContent = message;
+  }
+
+  function filteredIndices() {
+    const q = safeText(state.filter).toLowerCase();
+    return state.puzzles.map((p, i) => ({ p, i })).filter(({ p }) => {
+      if (state.failedOnly && p.win !== false) return false;
+      if (!q) return true;
+      return [p.id, p.rating, p.themes.join(' '), p.win === true ? 'solved win correct' : '', p.win === false ? 'failed incorrect' : '']
+        .join(' ').toLowerCase().includes(q);
+    });
+  }
+
+  function render() {
+    const total = state.puzzles.length;
+    const current = state.puzzles[state.currentIndex];
+    const done = state.completed.size;
+    $('[data-role="filename"]').textContent = state.sourceName ? `Playlist: ${state.sourceName}` : 'No file loaded.';
+    const visibleEntries = filteredIndices();
+    const visiblePosition = visibleEntries.findIndex(entry => entry.i === state.currentIndex);
+    $('[data-role="position"]').textContent = total ? `Puzzle ${state.currentIndex + 1} of ${total} · ${done} completed${state.failedOnly ? ` · ${visibleEntries.length} failed shown` : ''}` : 'No playlist loaded';
+    const link = $('[data-role="current-link"]');
+    if (current) {
+      link.href = puzzleUrl(current.id);
+      link.textContent = current.id;
+      const bits = [];
+      if (current.rating !== null) bits.push(`Rating ${current.rating}`);
+      if (current.win !== null) bits.push(current.win ? 'Previously solved' : 'Previously missed');
+      if (current.themes.length) bits.push(current.themes.join(', '));
+      $('[data-role="details"]').textContent = bits.join(' · ') || 'No extra puzzle metadata';
+    } else {
+      link.href = 'https://lichess.org/training';
+      link.textContent = 'Open a puzzle';
+      $('[data-role="details"]').textContent = 'Load a JSON file to begin.';
+    }
+
+    listEl.replaceChildren();
+    const entries = visibleEntries;
+    if (!entries.length) {
+      const empty = document.createElement('div');
+      empty.className = 'lpp-muted';
+      empty.style.padding = '12px';
+      empty.textContent = total ? 'No puzzles match this search.' : 'Your imported puzzles will appear here.';
+      listEl.appendChild(empty);
+    } else {
+      for (const { p, i } of entries) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'lpp-item' + (i === state.currentIndex ? ' active' : '');
+        button.dataset.index = String(i);
+        const mark = state.completed.has(p.id) ? '✓' : (p.win === true ? '●' : p.win === false ? '○' : '·');
+        const meta = [p.rating !== null ? `Rating ${p.rating}` : '', p.themes.slice(0, 3).join(', ')].filter(Boolean).join(' · ');
+        const main = document.createElement('span');
+        main.className = 'lpp-item-main';
+        const idLine = document.createElement('div');
+        idLine.className = 'lpp-id';
+        idLine.textContent = `${i + 1}. ${p.id}`;
+        const sub = document.createElement('div');
+        sub.className = 'lpp-sub';
+        sub.textContent = meta || 'Puzzle';
+        main.append(idLine, sub);
+        const check = document.createElement('span');
+        check.className = 'lpp-check';
+        check.textContent = mark;
+        button.append(main, check);
+        button.addEventListener('click', (event) => {
+          if (event.ctrlKey || event.metaKey || event.button === 1) {
+            window.open(puzzleUrl(p.id), '_blank', 'noopener');
+            return;
+          }
+          state.currentIndex = i;
+          persist();
+          render();
+        });
+        listEl.appendChild(button);
+      }
+    }
+
+    const hasItems = total > 0;
+    for (const action of ['prev', 'next', 'open', 'toggle-complete', 'shuffle', 'reset', 'export']) {
+      const button = root.querySelector(`[data-action="${action}"]`);
+      if (button) button.disabled = !hasItems;
+    }
+    $('[data-action="prev"]').disabled = !hasItems || (state.failedOnly || state.filter ? visiblePosition <= 0 : state.currentIndex <= 0);
+    $('[data-action="next"]').disabled = !hasItems || (state.failedOnly || state.filter ? visiblePosition < 0 || visiblePosition >= visibleEntries.length - 1 : state.currentIndex >= total - 1);
+    $('[data-action="toggle-complete"]').textContent = current && state.completed.has(current.id) ? 'Unmark completed' : 'Mark completed ✓';
+  }
+
+  function openCurrent(newTab = false) {
+    const p = state.puzzles[state.currentIndex];
+    if (!p) return;
+    const url = puzzleUrl(p.id);
+    if (newTab) window.open(url, '_blank', 'noopener');
+    else window.location.href = url;
+  }
+
+  function importData(data, filename) {
+    const items = extractItems(data);
+    const normalized = items.map(normalizePuzzle).filter(Boolean);
+    if (!normalized.length) throw new Error('No valid puzzle IDs found. Expected puzzle.id values or Lichess puzzle links.');
+    const seen = new Set();
+    state.puzzles = normalized.filter(p => {
+      if (seen.has(p.id)) return false;
+      seen.add(p.id);
+      return true;
+    });
+    state.currentIndex = 0;
+    state.completed = new Set();
+    state.sourceName = filename || 'Imported JSON';
+    state.filter = '';
+    state.failedOnly = false;
+    searchEl.value = '';
+    failedOnlyEl.checked = false;
+    persist();
+    render();
+    setStatus(`Loaded ${state.puzzles.length} unique puzzles.`);
+  }
+
+
+  async function loadApiHistory() {
+    const token = apiTokenEl.value.trim();
+    if (!token) {
+      setStatus('Enter your Lichess API token with puzzle:read permission. Do not share it in chat.');
+      apiTokenEl.focus();
+      return;
+    }
+    const rawMax = apiMaxEl.value.trim();
+    let max = null;
+    if (rawMax) {
+      max = Number(rawMax);
+      if (!Number.isSafeInteger(max) || max < 1) {
+        setStatus('Max entries must be a positive whole number, or blank to request all history.');
+        return;
+      }
+    }
+    const loadButton = $('[data-action="load-api"]');
+    loadButton.disabled = true;
+    const oldLabel = loadButton.textContent;
+    loadButton.textContent = 'Loading…';
+    setStatus('Connecting to Lichess and reading puzzle activity…');
+    try {
+      const endpoint = new URL('/api/puzzle/activity', location.origin);
+      if (max !== null) endpoint.searchParams.set('max', String(max));
+      const response = await fetch(endpoint.toString(), {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Accept': 'application/x-ndjson'
+        },
+        credentials: 'omit'
+      });
+      if (response.status === 401) throw new Error('Lichess rejected the token. Check that it is valid.');
+      if (response.status === 403) throw new Error('Access denied. Create/use a token with puzzle:read permission.');
+      if (!response.ok) throw new Error(`Lichess API returned HTTP ${response.status}.`);
+
+      const entries = [];
+      if (response.body && response.body.getReader) {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        while (true) {
+          const { value, done } = await reader.read();
+          buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+          const lines = buffer.split(/\r?\n/);
+          buffer = lines.pop() || '';
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            try { entries.push(JSON.parse(line)); }
+            catch (_) { throw new Error('Lichess returned an unreadable activity entry.'); }
+            if (entries.length % 250 === 0) setStatus(`Reading Lichess history… ${entries.length.toLocaleString()} entries`);
+          }
+          if (done) break;
+        }
+        if (buffer.trim()) {
+          try { entries.push(JSON.parse(buffer)); }
+          catch (_) { throw new Error('Lichess returned an incomplete activity entry.'); }
+        }
+      } else {
+        const text = await response.text();
+        for (const line of text.split(/\r?\n/)) if (line.trim()) entries.push(JSON.parse(line));
+      }
+
+      if (!entries.length) throw new Error('Lichess returned no puzzle activity for this account.');
+      // Keep only the fields this playlist needs; don't persist solutions/FENs from API responses.
+      const compact = entries.map(entry => ({
+        date: entry.date,
+        win: typeof entry.win === 'boolean' ? entry.win : null,
+        puzzle: {
+          id: entry.puzzle && entry.puzzle.id,
+          rating: entry.puzzle && entry.puzzle.rating,
+          themes: entry.puzzle && Array.isArray(entry.puzzle.themes) ? entry.puzzle.themes : []
+        }
+      }));
+      importData(compact, `Lichess API history (${entries.length.toLocaleString()} entries)`);
+      setStatus(`Loaded ${state.puzzles.length.toLocaleString()} unique puzzles from Lichess. Token cleared.`);
+    } catch (err) {
+      setStatus(`Could not load Lichess history: ${err.message || 'Unknown error'}`);
+    } finally {
+      apiTokenEl.value = '';
+      loadButton.disabled = false;
+      loadButton.textContent = oldLabel;
+    }
+  }
+
+  root.addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-action]');
+    if (!button) return;
+    const action = button.dataset.action;
+    if (action === 'load') fileInput.click();
+    if (action === 'load-api') loadApiHistory();
+    if (action === 'close') root.remove();
+    if (action === 'minimize') {
+      state.collapsed = !state.collapsed;
+      $('.lpp-body').classList.toggle('lpp-hidden', state.collapsed);
+      button.textContent = state.collapsed ? '+' : '−';
+    }
+    if (action === 'prev') {
+      const entries = filteredIndices();
+      const pos = entries.findIndex(entry => entry.i === state.currentIndex);
+      if (pos > 0) { state.currentIndex = entries[pos - 1].i; persist(); render(); }
+    }
+    if (action === 'next') {
+      const entries = filteredIndices();
+      const pos = entries.findIndex(entry => entry.i === state.currentIndex);
+      if (pos >= 0 && pos < entries.length - 1) { state.currentIndex = entries[pos + 1].i; persist(); render(); }
+    }
+    if (action === 'open') openCurrent(false);
+    if (action === 'toggle-complete') {
+      const p = state.puzzles[state.currentIndex];
+      if (p) {
+        if (state.completed.has(p.id)) state.completed.delete(p.id);
+        else state.completed.add(p.id);
+        persist(); render();
+      }
+    }
+    if (action === 'shuffle' && state.puzzles.length > 1) {
+      const current = state.puzzles[state.currentIndex];
+      for (let i = state.puzzles.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [state.puzzles[i], state.puzzles[j]] = [state.puzzles[j], state.puzzles[i]];
+      }
+      state.currentIndex = Math.max(0, state.puzzles.findIndex(p => p.id === current?.id));
+      persist(); render(); setStatus('Playlist shuffled.');
+    }
+    if (action === 'reset') {
+      state.completed.clear(); persist(); render(); setStatus('Completion marks cleared.');
+    }
+    if (action === 'export' && state.puzzles.length) {
+      const blob = new Blob([JSON.stringify(state.puzzles.map(p => ({
+        puzzle: { id: p.id, ...(p.rating !== null ? { rating: p.rating } : {}), themes: p.themes },
+        win: p.win,
+        url: puzzleUrl(p.id)
+      })), null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = 'lichess-puzzle-playlist.json'; a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setStatus('Playlist exported.');
+    }
+  });
+
+  fileInput.addEventListener('change', async () => {
+    const file = fileInput.files && fileInput.files[0];
+    if (!file) return;
+    try {
+      const data = JSON.parse(await file.text());
+      importData(data, file.name);
+    } catch (err) {
+      setStatus(`Import failed: ${err.message || 'Could not read JSON.'}`);
+    } finally {
+      fileInput.value = '';
+    }
+  });
+
+  searchEl.addEventListener('input', () => {
+    state.filter = searchEl.value;
+    render();
+  });
+
+  failedOnlyEl.addEventListener('change', () => {
+    state.failedOnly = failedOnlyEl.checked;
+    const entries = filteredIndices();
+    if (entries.length && !entries.some(entry => entry.i === state.currentIndex)) {
+      state.currentIndex = entries[0].i;
+    }
+    persist();
+    render();
+    setStatus(state.failedOnly ? `Showing ${entries.length} failed puzzles (win = false).` : 'Showing all puzzles.');
+  });
+
+  restore();
+  render();
+})();
